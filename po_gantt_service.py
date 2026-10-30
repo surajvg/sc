@@ -4,6 +4,7 @@ po_gantt_service.py  -  Production Schedule: PO on Process / PO on Machines / Pl
     GET    /schedule/po-gantt                 the schedule (stations = process rows, machines = machine rows)
     GET    /schedule/po-gantt/orders          yet-to-start POs + part numbers of the plant (pickers)
     GET    /schedule/po-gantt/plants          plant codes
+    GET    /schedule/po-gantt/process-check   every process: batch or series and why (process_type), batch size, machines
     GET    /schedule/po-gantt/export          the same schedule as .xlsx (sheet 1 process, sheet 2 machines)
     GET/PUT /schedule/part-process-time       machine hours + batch size per part / process
     POST   /schedule/plans                    save the schedule (built again with the same inputs) -> schedule_plan(+_item)
@@ -22,7 +23,8 @@ RULES
  * CHILD / MAIN comes from product_type_master.sub_product_type_name. A MAIN part is fed by the CHILD part with the
    same product_type_name (HEXA child 62005774DA -> HEXA main 113300033357). bom_items is only a fallback link.
  * The flow of a part = product_workflow_mapping ordered by step_sequence. A PO runs its flow process after process,
-   as one block (the whole quantity). Child POs are scheduled first; a main PO waits for the child PO(s) that feed it.
+   as one block (the whole quantity). A main PO starts right after the child PO(s) that feed it
+    finish (not after ALL child POs): linked POs are scheduled as one chain, and a run can use any free gap of a machine.
  * SMT LINE = the 4 TOP SIDE steps in LINE_GROUPS: one process / one row, run in one go INSIDE ONE WORKING DAY (and in
    one free stretch of its machines). Line time = slowest step for the whole PO + one board through the other steps.
  * MACHINES: equipment_details (stage_id = process, machine_id). A machine is ONE resource: if the same machine_id
@@ -45,24 +47,26 @@ RULES
  * ACTUAL (Planned vs Actual): operator_log (PCB x step, start_time / end_time), pcb_process_log via pcb_assignment
    when operator_log has no row. A process is done for a PO when every PCB of the PO has an end time there.
 """
+import gzip
 import io
+import json
 import math
 import re
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import func, inspect as sa_inspect, text as sa_text
+from sqlalchemy import func, or_, inspect as sa_inspect, text as sa_text
 from sqlalchemy.orm import Session, joinedload
 
 from Database_models import (
     BOMItem, CalendarException, Equipments, MachineBreakdownLog, MaintenanceScheduleLog, OperatorLog,
     OperatorShiftAssignment, OperatorStepMapping, PartProcessTime, PCBAssignment, PcbData, PCBProcessLog, Plant,
     ProcessFlowMaster, Processtype, ProductTypeMaster, ProductWorkflowMapping, PublicHoliday, SchedulePlan,
-    SchedulePlanItem, ShiftDefinition, StageCapacityDB, StageScheduleConfig,
+    SchedulePlanItem, ShiftDefinition, StageCapacityDB, StageScheduleConfig, InventorySpares, Consumables
 )
 
 # --------------------------------------------------------------------------------------
@@ -77,10 +81,14 @@ DEFAULT_SHIFT_START = 8.0          # day window starts 08:00
 DAY_END_HOUR = 22.0                # ... and never runs past 22:00 (window = 08:00 - 22:00 = 14 h)
 DEFAULT_BATCH_SIZE = 30
 FALLBACK_MINUTES = 1.0
+MANUAL_PARALLEL_SLOTS = 1          # a MANUAL process (no machine) can work on this many POs at the same time (1 = one PO at a time)
+HANDOFF_WARN_HOURS = 30.0          # warn when a main PO starts later than this after the child PO it needs has finished
 PCB_OPEN_STATUSES = {"new", "assigned"}      # PcbData.status values that count as "not started"
 EXTRA_CHILD_LINKS: Dict[str, str] = {}      # {main_part_no: child_part_no} to force a link
 
 OPEN_BREAKDOWN_HOURS = 24.0        # open breakdown with no ready date / downtime: machine blocked until now + this
+DEFAULT_SPARE_LEAD_DAYS = 7        # inventorty_spares.procurement_lead_time empty / not a number
+CONSUMABLE_RESTOCK_DAYS = 7        # consumable out of stock / expired: process blocked from now for this many days (no restock date in the table)
 DONE_STATUSES = {"completed", "complete", "done", "closed", "resolved"}
 LATE_TOLERANCE_MIN = 0.0           # Planned vs Actual: finishing up to this many minutes after plan is "on time"
 
@@ -300,6 +308,11 @@ class DayCalendar:
                     return a, e, day, [(day, a, e, minutes)], True
                 if k > 20000:
                     break
+        # longer than one working day: start at the beginning of a day, so it is spread over as few days as possible
+        for day, a, b in self.free_pieces(start, cap_min, blocks):
+            if a == self.window(day, cap_min)[0]:
+                start = a
+                break
         return self.consume(start, minutes, cap_min, blocks) + (False,)
 
 
@@ -317,10 +330,11 @@ class Station:
         self.setup = self.cooldown = 0.0
         self.cd_working_only = self.next_day_release = False
         self.operators = 0
+        self.material: List[Dict[str, Any]] = []        # consumable shortages of its steps
 
     @property
     def machines(self) -> List[str]:
-        return [o["name"] for o in self.options]
+        return [o["name"] for o in self.options if o["name"]]
 
 
 # --------------------------------------------------------------------------------------
@@ -329,7 +343,15 @@ class Station:
 def _load_candidates(db: Session, plant: Optional[str], warnings: List[str]) -> Dict[str, Dict[str, Any]]:
     """POs come ONLY from PcbData. Plant filter: the PO's part number must belong to that plant in
     product_type_master (PcbData.plant is only used for parts missing from the master).
-    A PO is loadable when EVERY one of its PCBs has status New or Assigned."""
+    A PO is loadable when EVERY one of its PCBs has status New or Assigned.
+    PcbData.status stays 'Assigned' after the PCB is finished (the assign step is the only place that changes it), so a
+    PO whose PCBs are ALL finished in pcb_assignment (current_step_id empty or overall_status done) is left out -
+    otherwise every PO ever made would be scheduled again."""
+    finished = set()
+    for (pid,) in db.query(PCBAssignment.assigned_pcb_id).filter(or_(
+            PCBAssignment.current_step_id.is_(None),
+            func.lower(func.coalesce(PCBAssignment.overall_status, "")).in_(list(DONE_STATUSES)))).all():
+        finished.add(pid)
     plant_parts, known_parts = set(), set()
     if plant:
         for pn, pc in db.query(ProductTypeMaster.part_number, ProductTypeMaster.plant_code).all():
@@ -337,7 +359,8 @@ def _load_candidates(db: Session, plant: Optional[str], warnings: List[str]) -> 
             if pc == plant:
                 plant_parts.add(_norm(pn))
     q = db.query(PcbData.productionOrder, PcbData.partNumber, PcbData.quantity, PcbData.status, PcbData.createdAt,
-                 PcbData.plant).filter(PcbData.productionOrder.isnot(None), PcbData.productionOrder != "")
+                 PcbData.plant, PcbData.serialNo, PcbData.PCBserialNoPartNumber, PcbData.Type
+                 ).filter(PcbData.productionOrder.isnot(None), PcbData.productionOrder != "")
     by_po: Dict[str, list] = defaultdict(list)
     for r in q.all():
         if plant:
@@ -348,6 +371,8 @@ def _load_candidates(db: Session, plant: Optional[str], warnings: List[str]) -> 
 
     cands: Dict[str, Dict[str, Any]] = {}
     for po, rows in by_po.items():
+        if all(r[7] in finished for r in rows):              # every PCB finished -> history, not scheduled
+            continue
         parts = [r[1] for r in rows if r[1]]
         if not parts:
             warnings.append(f"PO {po}: PCBs have no part number - ignored")
@@ -361,8 +386,78 @@ def _load_candidates(db: Session, plant: Optional[str], warnings: List[str]) -> 
             "qty": sum(r[2] if (r[2] and r[2] > 0) else 1 for r in rows),
             "created": min(created) if created else None,
             "started": any((r[3] or "").strip().lower() not in PCB_OPEN_STATUSES for r in rows),
+            # every PCB of the PO: serial number (links child <-> main), PCB id (pcb_assignment), Type, status
+            "pcbs": [{"sn": r[6], "serial": (r[6] or "").strip().upper(), "pcb_id": r[7], "part": r[1],
+                      "type": (r[8] or "").strip().upper(), "status": (r[3] or "").strip().lower()} for r in rows],
         }
     return cands
+
+
+def _serial_links(db: Session, cands: Dict[str, Dict[str, Any]], role_of, child_of: Dict[str, str], main_pos: List[str]):
+    """Child -> main link by SERIAL NUMBER (same rule as the assign step, can_proceed in Data_Server):
+    the main PCB with serialNo S needs the child PCB with the same serialNo S.
+    Only for `main_pos` (the main POs being scheduled); their child PCBs are looked up in PcbData by serial number, so a
+    child PO that is already finished (and so not a candidate) is still found.
+    Returns
+      links {main_po: [{child_po, child_part, pcbs, done, in_progress, not_assigned, steps}]}
+      unmatched {main_po: number of main PCBs with no child PCB of the same serial}
+    State of a child PCB (pcb_assignment.assigned_pcb_id = PCBserialNoPartNumber):
+      no assignment row                     -> not assigned
+      current_step_id empty / status done   -> done (child flow finished)
+      current_step_id filled                -> in process (at that step)"""
+    def is_main(pcb) -> bool:
+        return pcb["type"].endswith("MAIN") or role_of(pcb["part"]) == "MAIN"
+
+    mains = [po for po in main_pos if po in cands and role_of(cands[po]["part"]) == "MAIN"]
+    serials = sorted({pcb["sn"].strip() for po in mains for pcb in cands[po]["pcbs"] if pcb["sn"] and pcb["sn"].strip()})
+    child_by_serial: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for chunk in _chunks(serials):
+        for sn, pid, part, po, typ, status in db.query(
+                PcbData.serialNo, PcbData.PCBserialNoPartNumber, PcbData.partNumber, PcbData.productionOrder,
+                PcbData.Type, PcbData.status).filter(PcbData.serialNo.in_(chunk)).all():
+            typ = (typ or "").strip().upper()
+            if po and (typ.endswith("CHILD") or role_of(part) == "CHILD"):
+                child_by_serial[(sn or "").strip().upper()].append(
+                    {"po": _norm(po), "pcb_id": pid, "part": part, "status": (status or "").strip().lower()})
+
+    ids = [ch["pcb_id"] for lst in child_by_serial.values() for ch in lst if ch["pcb_id"]]
+    state: Dict[str, Tuple[Optional[int], str]] = {}
+    for chunk in _chunks(ids):
+        for a in db.query(PCBAssignment).filter(PCBAssignment.assigned_pcb_id.in_(chunk)).all():
+            state[a.assigned_pcb_id] = (a.current_step_id, (a.overall_status or "").strip().lower())
+
+    links: Dict[str, List[Dict[str, Any]]] = {}
+    unmatched: Dict[str, int] = {}
+    for po in mains:
+        c = cands[po]
+        per_child: Dict[str, Dict[str, Any]] = {}
+        missing = 0
+        for pcb in c["pcbs"]:
+            if not is_main(pcb):
+                continue
+            hits = [ch for ch in child_by_serial.get(pcb["serial"], []) if ch["part"] != c["part"]]
+            want = child_of.get(c["part"])
+            hits = [h for h in hits if h["part"] == want] or hits          # prefer the child part of its family
+            if not hits:
+                missing += 1
+                continue
+            ch = hits[0]
+            l = per_child.setdefault(ch["po"], {"child_po": ch["po"], "child_part": ch["part"], "pcbs": 0, "done": 0,
+                                                "in_progress": 0, "not_assigned": 0, "steps": []})
+            l["pcbs"] += 1
+            st = state.get(ch["pcb_id"])
+            if ch["status"] in DONE_STATUSES or (st and (st[0] is None or st[1] in DONE_STATUSES)):
+                l["done"] += 1
+            elif st:
+                l["in_progress"] += 1
+                if st[0] not in l["steps"]:
+                    l["steps"].append(st[0])
+            else:
+                l["not_assigned"] += 1
+        if per_child:
+            links[po] = list(per_child.values())
+            unmatched[po] = missing
+    return links, unmatched
 
 
 def _product_links(db: Session, warnings: Optional[List[str]] = None):
@@ -415,10 +510,91 @@ def _product_links(db: Session, warnings: Optional[List[str]] = None):
     return products, child_of, role_of
 
 
+# def _load_downtime(db: Session, machines: Dict[str, Dict[str, Any]], not_before: datetime, now: datetime,
+#                    warnings: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+#     """Down-time events per machine_id from machine_breakdown_logs and maintenance_schedules.
+#     `machines` = {machine_id: {"name", "eqpt_no", ...}} of the plant. Only events ending after `not_before` are kept."""
+#     by_id = {_key(mid): mid for mid in machines}
+#     names: Dict[str, List[str]] = defaultdict(list)
+#     for mid, info in machines.items():
+#         for n in {_key(info.get("name")), _key(info.get("eqpt_no"))} - {""}:
+#             if mid not in names[n]:
+#                 names[n].append(mid)
+
+#     def match(rec_id, rec_name) -> Optional[str]:
+#         mid = by_id.get(_key(rec_id))
+#         if mid:
+#             return mid
+#         for k in (_key(rec_id), _key(rec_name)):
+#             if k and len(names.get(k, [])) == 1:          # only an unambiguous name
+#                 return names[k][0]
+#         return None
+
+#     out: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+#     assumed = 0
+#     try:
+#         breakdowns = db.query(MachineBreakdownLog).all()
+#     except Exception as exc:                                 # table missing -> schedule without it
+#         db.rollback()
+#         warnings.append(f"machine_breakdown_logs could not be read ({exc.__class__.__name__}) - breakdowns ignored")
+#         breakdowns = []
+#     for b in breakdowns:
+#         mid = match(b.machine_id, b.machine_name)
+#         if not mid:
+#             continue
+#         st = _parse_dt(b.breakdown_date)
+#         if not st:
+#             continue
+#         tt = _parse_time(b.breakdown_time)
+#         if tt and st.time() == time.min:
+#             st = datetime.combine(st.date(), tt)
+#         is_open = (b.status or "").strip().lower() not in DONE_STATUSES
+#         en, note = _parse_dt(b.mc_ready_date), None
+#         if not en and b.downtime_hours and b.downtime_hours > 0:
+#             en = st + timedelta(hours=float(b.downtime_hours))
+#         if not en and is_open:
+#             en = max(now, st) + timedelta(hours=OPEN_BREAKDOWN_HOURS)
+#             note = f"still open - assumed down until {_iso(en)}"
+#             assumed += 1
+#         if not en or en <= st or en <= not_before:
+#             continue
+#         out[mid].append({"machine": mid, "kind": "BREAKDOWN", "label": b.event_type or "Breakdown",
+#                          "status": b.status, "start": st, "end": en,
+#                          "note": note or (b.issue_description or "")})
+
+#     try:
+#         pms = db.query(MaintenanceScheduleLog).all()
+#     except Exception as exc:
+#         db.rollback()
+#         warnings.append(f"maintenance_schedules could not be read ({exc.__class__.__name__}) - maintenance ignored")
+#         pms = []
+#     for m in pms:
+#         mid = match(m.machine_id, m.machine_name)
+#         if not mid:
+#             continue
+#         for q in (1, 2, 3, 4):
+#             status = (getattr(m, f"q{q}_status") or "").strip().lower()
+#             if status in DONE_STATUSES:
+#                 continue
+#             d = _parse_dt(getattr(m, f"q{q}_actual_date")) or _parse_dt(getattr(m, f"q{q}_planned_date"))
+#             if not d:
+#                 continue
+#             st = datetime.combine(d.date(), time.min)
+#             en = st + timedelta(days=1)
+#             if en <= not_before:
+#                 continue
+#             out[mid].append({"machine": mid, "kind": "PM", "label": m.event_type or "Preventive Maintenance",
+#                              "status": getattr(m, f"q{q}_status"), "start": st, "end": en,
+#                              "note": f"Q{q} maintenance" + (f" - {m.remarks}" if m.remarks else "")})
+#     if assumed:
+#         warnings.append(f"{assumed} open breakdown(s) without ready date / downtime - machine assumed down for "
+#                         f"{OPEN_BREAKDOWN_HOURS:g} h from now")
+#     for mid in out:
+#         out[mid].sort(key=lambda e: e["start"])
+#     return out
+
 def _load_downtime(db: Session, machines: Dict[str, Dict[str, Any]], not_before: datetime, now: datetime,
                    warnings: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-    """Down-time events per machine_id from machine_breakdown_logs and maintenance_schedules.
-    `machines` = {machine_id: {"name", "eqpt_no", ...}} of the plant. Only events ending after `not_before` are kept."""
     by_id = {_key(mid): mid for mid in machines}
     names: Dict[str, List[str]] = defaultdict(list)
     for mid, info in machines.items():
@@ -428,31 +604,55 @@ def _load_downtime(db: Session, machines: Dict[str, Dict[str, Any]], not_before:
 
     def match(rec_id, rec_name) -> Optional[str]:
         mid = by_id.get(_key(rec_id))
-        if mid:
-            return mid
+        if mid: return mid
         for k in (_key(rec_id), _key(rec_name)):
-            if k and len(names.get(k, [])) == 1:          # only an unambiguous name
-                return names[k][0]
+            if k and len(names.get(k, [])) == 1: return names[k][0]
         return None
 
     out: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    assumed = 0
+
+    # 1. Spares (inventorty_spares): a spare only matters when its machine is DOWN. If the spare is out of stock, an open
+    #    breakdown of that machine lasts at least the procurement lead time (the repair waits for the spare).
+    #    A running machine is NOT blocked because a spare is missing - that is only a risk (warning).
+    try:
+        spares = db.query(InventorySpares).all()
+    except Exception:
+        db.rollback()
+        spares = []
+    spare_out: Dict[str, Tuple[int, str]] = {}           # machine_id -> (lead days, spare text)
+    low_spares: List[str] = []
+    for sp in spares:
+        q, th = _num(sp.qty_avl), _num(sp.threshold_qty)
+        if q is None:                                    # no stock figure -> nothing to check
+            continue
+        if sp.eqpt_no:
+            mids = [match(sp.eqpt_no, None)]
+        else:                                            # spare of a process: every machine of that process
+            mids = [m for m, info in machines.items() if sp.flow_step_id in info.get("stage_ids", [])]
+        mids = [m for m in mids if m]
+        text = sp.decription or sp.part_number or "spare"
+        if q <= 0:
+            days = _lead_days(sp.procurement_lead_time)
+            for m in mids:
+                if days >= spare_out.get(m, (0, ""))[0]:
+                    spare_out[m] = (days, text)
+        elif th is not None and q <= th:
+            low_spares.append(f"{text} ({', '.join(mids) or sp.eqpt_no or 'no machine'}: {q:g} left, threshold {th:g})")
+
+    # 2. Machine Breakdowns
     try:
         breakdowns = db.query(MachineBreakdownLog).all()
-    except Exception as exc:                                 # table missing -> schedule without it
+    except Exception:
         db.rollback()
-        warnings.append(f"machine_breakdown_logs could not be read ({exc.__class__.__name__}) - breakdowns ignored")
         breakdowns = []
+    waiting_spare = set()
     for b in breakdowns:
         mid = match(b.machine_id, b.machine_name)
-        if not mid:
-            continue
+        if not mid: continue
         st = _parse_dt(b.breakdown_date)
-        if not st:
-            continue
+        if not st: continue
         tt = _parse_time(b.breakdown_time)
-        if tt and st.time() == time.min:
-            st = datetime.combine(st.date(), tt)
+        if tt and st.time() == time.min: st = datetime.combine(st.date(), tt)
         is_open = (b.status or "").strip().lower() not in DONE_STATUSES
         en, note = _parse_dt(b.mc_ready_date), None
         if not en and b.downtime_hours and b.downtime_hours > 0:
@@ -460,43 +660,188 @@ def _load_downtime(db: Session, machines: Dict[str, Dict[str, Any]], not_before:
         if not en and is_open:
             en = max(now, st) + timedelta(hours=OPEN_BREAKDOWN_HOURS)
             note = f"still open - assumed down until {_iso(en)}"
-            assumed += 1
-        if not en or en <= st or en <= not_before:
-            continue
+            if mid in spare_out:                         # the repair needs a spare that is not in stock
+                days, text = spare_out[mid]
+                en = max(en, max(now, st) + timedelta(days=days))
+                note = f"waiting for spare '{text}' (out of stock, lead time {days} day(s)) - down until {_iso(en)}"
+                waiting_spare.add(mid)
+        if not en or en <= st or en <= not_before: continue
         out[mid].append({"machine": mid, "kind": "BREAKDOWN", "label": b.event_type or "Breakdown",
-                         "status": b.status, "start": st, "end": en,
-                         "note": note or (b.issue_description or "")})
+                         "status": b.status, "start": st, "end": en, "note": note or (b.issue_description or "")})
+    if waiting_spare:
+        warnings.append("Breakdown repair waits for an out-of-stock spare (lead time used): "
+                        + ", ".join(f"{m} - {spare_out[m][1]} ({spare_out[m][0]} d)" for m in sorted(waiting_spare)))
+    risk = sorted(m for m in spare_out if m not in waiting_spare)
+    if risk:
+        warnings.append("Spare out of stock (machine still running - a breakdown there would take the lead time): "
+                        + ", ".join(f"{m} - {spare_out[m][1]} ({spare_out[m][0]} d)" for m in risk))
+    if low_spares:
+        warnings.append("Spares at or below threshold: " + "; ".join(low_spares))
 
+    # 3. Maintenance Schedules
     try:
         pms = db.query(MaintenanceScheduleLog).all()
-    except Exception as exc:
+    except Exception:
         db.rollback()
-        warnings.append(f"maintenance_schedules could not be read ({exc.__class__.__name__}) - maintenance ignored")
         pms = []
     for m in pms:
         mid = match(m.machine_id, m.machine_name)
-        if not mid:
-            continue
+        if not mid: continue
         for q in (1, 2, 3, 4):
-            status = (getattr(m, f"q{q}_status") or "").strip().lower()
-            if status in DONE_STATUSES:
-                continue
+            if (getattr(m, f"q{q}_status") or "").strip().lower() in DONE_STATUSES: continue
             d = _parse_dt(getattr(m, f"q{q}_actual_date")) or _parse_dt(getattr(m, f"q{q}_planned_date"))
-            if not d:
-                continue
+            if not d: continue
             st = datetime.combine(d.date(), time.min)
             en = st + timedelta(days=1)
-            if en <= not_before:
-                continue
+            if en <= not_before: continue
             out[mid].append({"machine": mid, "kind": "PM", "label": m.event_type or "Preventive Maintenance",
                              "status": getattr(m, f"q{q}_status"), "start": st, "end": en,
                              "note": f"Q{q} maintenance" + (f" - {m.remarks}" if m.remarks else "")})
-    if assumed:
-        warnings.append(f"{assumed} open breakdown(s) without ready date / downtime - machine assumed down for "
-                        f"{OPEN_BREAKDOWN_HOURS:g} h from now")
+
     for mid in out:
         out[mid].sort(key=lambda e: e["start"])
     return out
+
+def _num(v) -> Optional[float]:
+    """'12', '12.5', ' 12 nos' -> number; empty / text -> None."""
+    m = re.search(r"-?\d+(\.\d+)?", str(v)) if v is not None else None
+    return float(m.group()) if m else None
+
+
+def _lead_days(v) -> int:
+    """procurement_lead_time: '10', '10 days', '2 weeks' -> days."""
+    n = _num(v)
+    if n is None or n <= 0:
+        return DEFAULT_SPARE_LEAD_DAYS
+    return int(math.ceil(n * 7)) if "week" in str(v).lower() else int(math.ceil(n))
+
+
+def _load_consumable_blocks(db: Session, now: datetime, not_before: datetime,
+                            warnings: List[str]) -> Dict[int, List[Dict[str, Any]]]:
+    """Consumables (consumables table) of every process (stage_id = flow_step_id).
+    A consumable (material number) is usable when one of its rows has quantity > 0 (empty quantity = not counted, taken
+    as available) and is not past consumable_shelf_life. The PROCESS cannot run (all its machines, and a process without
+    a machine too) while one of its consumables is not usable:
+        out of stock / already expired -> blocked from now for CONSUMABLE_RESTOCK_DAYS
+        every batch in stock expires   -> blocked from the day after the last expiry for CONSUMABLE_RESTOCK_DAYS
+    The table has no use per PCB, so stock is checked as available yes / no, it is not used up PCB by PCB."""
+    try:
+        rows = db.query(Consumables).all()
+    except Exception:
+        db.rollback()
+        return {}
+    groups: Dict[Tuple[int, str], list] = defaultdict(list)
+    for c in rows:
+        if c.stage_id is not None:
+            groups[(c.stage_id, _key(c.consumable_material_number) or _key(c.consumable_material_name))].append(c)
+    today = now.date()
+
+    def expiry(c) -> Optional[date]:
+        d = c.consumable_shelf_life
+        return d.date() if isinstance(d, datetime) else d
+
+    out: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    low: List[str] = []
+    for (sid, _), lst in groups.items():
+        first = lst[0]
+        name = first.consumable_material_name or first.consumable_material_number or "consumable"
+        mat = first.consumable_material_number or ""
+        in_stock = [c for c in lst if c.quantity is None or c.quantity > 0]
+        usable = [c for c in in_stock if not expiry(c) or expiry(c) >= today]
+        ev = None
+        if not usable:
+            why = "out of stock" if not in_stock else f"expired on {max(expiry(c) for c in in_stock):%d-%m-%Y}"
+            ev = {"label": "Consumable " + ("out of stock" if not in_stock else "expired"), "start": now,
+                  "end": now + timedelta(days=CONSUMABLE_RESTOCK_DAYS),
+                  "note": f"{name} {mat} {why} - assumed back in {CONSUMABLE_RESTOCK_DAYS} day(s)"}
+        elif all(expiry(c) for c in usable):
+            last = max(expiry(c) for c in usable)
+            st = datetime.combine(last + timedelta(days=1), time.min)
+            ev = {"label": "Consumable expires", "start": st, "end": st + timedelta(days=CONSUMABLE_RESTOCK_DAYS),
+                  "note": f"{name} {mat}: the stock expires on {last:%d-%m-%Y} - assumed back in {CONSUMABLE_RESTOCK_DAYS} day(s)"}
+        if ev and ev["end"] > not_before:
+            out[sid].append({"machine": None, "kind": "SHORTAGE", "status": "Awaiting stock", "stage_id": sid,
+                             "material": mat, "material_name": name, **ev})
+        qty = [c.quantity for c in usable if c.quantity is not None]
+        th = max((x for x in (_num(c.threshold_qty) for c in lst) if x is not None), default=None)
+        if usable and qty and th is not None and sum(qty) <= th:
+            low.append(f"{name} (step {sid}: {sum(qty)} left, threshold {th:g})")
+    if low:
+        warnings.append("Consumables at or below threshold: " + "; ".join(low))
+    return out
+
+
+def _send(result: Dict[str, Any], request: Request, drop_for_page: bool = False) -> Response:
+    """Fast JSON for big schedules: no jsonable_encoder walk (the result is already plain JSON), no spaces, and gzip when
+    the browser accepts it (1.2 MB -> ~0.1 MB). drop_for_page: leave out what the page does not use
+    (rows' cells / po_runs and the flat runs list - Save plan / Excel build the schedule again on the server)."""
+    if drop_for_page:
+        result = {**result, "runs": None,
+                  "stations": [{k: v for k, v in s.items() if k not in ("cells", "po_runs")} for s in result["stations"]]}
+    body = json.dumps(result, separators=(",", ":"), default=str).encode()
+    if len(body) > 20000 and "gzip" in (request.headers.get("accept-encoding") or ""):
+        return Response(gzip.compress(body, 5), media_type="application/json",
+                        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+    return Response(body, media_type="application/json")
+
+
+def _batch_steps(db: Session) -> Dict[int, Tuple[Optional[bool], str]]:
+    """Batch or series for every process (flow_step_id) and WHY - from process_type (stage_id, process_type_batch).
+      1. a process_type row with stage_id = flow_step_id                         -> its process_type_batch
+      2. else a row with stage_id = the step's step_order (the way the equipment page stores stage_id),
+         when that number is not the flow_step_id of another step                -> its process_type_batch
+      3. else no row                                                              -> series (None = row missing)
+    stage_schedule_config.batch_size is NOT used to decide: it defaults to 30 for every process."""
+    flags: Dict[int, bool] = {}
+    for p in db.query(Processtype).all():
+        if p.stage_id is not None:
+            flags[p.stage_id] = flags.get(p.stage_id, False) or bool(p.process_type_batch)
+    steps = db.query(ProcessFlowMaster).all()
+    ids = {s.flow_step_id for s in steps}
+    out: Dict[int, Tuple[Optional[bool], str]] = {}
+    for s in steps:
+        sid, so = s.flow_step_id, s.step_order
+        if sid in flags:
+            out[sid] = (flags[sid], f"process_type.stage_id = {sid} (flow_step_id)")
+        elif so is not None and so in flags and so not in ids:
+            out[sid] = (flags[so], f"process_type.stage_id = {so} (stored as step_order)")
+        else:
+            out[sid] = (None, f"no process_type row for flow_step_id {sid}" + (f" / step_order {so}" if so is not None else ""))
+    return out
+
+
+def process_check(db: Session, plant: Optional[str] = None) -> Dict[str, Any]:
+    """GET /schedule/po-gantt/process-check - every process: batch or series and why, batch size, machines.
+    Use it when a process is scheduled the wrong way (e.g. a batch process shown as one block per PO)."""
+    batch = _batch_steps(db)
+    cfg = {c.stage_id: c for c in db.query(StageScheduleConfig).all()}
+    eq: Dict[int, List[str]] = defaultdict(list)
+    for e in db.query(Equipments).all():
+        if e.stage_id is not None and (not plant or not e.plant_code or e.plant_code == plant):
+            eq[e.stage_id].append(e.machine_id or e.eqpt_no or f"EQ-{e.id}")
+    sizes: Dict[int, List[int]] = defaultdict(list)
+    tq = db.query(PartProcessTime.process_id, PartProcessTime.batch_size).filter(PartProcessTime.batch_size.isnot(None))
+    if plant:
+        tq = tq.filter(PartProcessTime.plant == plant)
+    for pid, bs in tq.all():
+        if bs and bs > 0 and bs not in sizes[pid]:
+            sizes[pid].append(bs)
+    q = db.query(ProcessFlowMaster)
+    if plant:
+        q = q.filter(or_(ProcessFlowMaster.plant_code == plant, ProcessFlowMaster.plant_code.is_(None)))
+    rows = []
+    for s in q.order_by(ProcessFlowMaster.step_order, ProcessFlowMaster.flow_step_id).all():
+        b, why = batch.get(s.flow_step_id, (None, "-"))
+        c = cfg.get(s.flow_step_id)
+        rows.append({
+            "flow_step_id": s.flow_step_id, "step_order": s.step_order, "process": s.step_name,
+            "scheduled_as": "BATCH" if b else "SERIES", "why": why, "process_type_row": b is not None,
+            "batch_size_config": c.batch_size if c else None, "batch_size_parts": sorted(sizes.get(s.flow_step_id, [])),
+            "machines_by_flow_step_id": eq.get(s.flow_step_id, []),
+            "machines_by_step_order": eq.get(s.step_order, []) if s.step_order != s.flow_step_id else [],
+        })
+    return {"plant": plant, "processes": rows,
+            "missing_process_type": [r["process"] for r in rows if not r["process_type_row"]]}
 
 
 def _dt_json(e: Dict[str, Any]) -> Dict[str, Any]:
@@ -569,7 +914,7 @@ def list_part_process_times(db: Session, plant: Optional[str], part_no: Optional
     pns = [p.part_number for p in products]
     if not pns:
         return {"plant": plant, "parts": [], "rows": []}
-    batch = {p.stage_id for p in db.query(Processtype).filter(Processtype.process_type_batch.is_(True)).all()}
+    batch = {sid for sid, (b, _) in _batch_steps(db).items() if b}
     ppt = {}
     tq = db.query(PartProcessTime).filter(PartProcessTime.part_no.in_(pns))
     if plant:
@@ -659,12 +1004,22 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
     # ---------------- masters (loaded once) ----------------
     products, child_of, role_of = _product_links(db, warnings)
 
-    is_batch: Dict[int, bool] = defaultdict(bool)
-    for p in db.query(Processtype).all():
-        if p.process_type_batch:
-            is_batch[p.stage_id] = True
+    batch_rule = _batch_steps(db)                                  # flow_step_id -> (batch?, why)
+    is_batch: Dict[int, bool] = defaultdict(bool, {sid: bool(b) for sid, (b, _) in batch_rule.items()})
     cfg = {c.stage_id: c for c in db.query(StageScheduleConfig).all()}
     cap_by_key = {_key(c.name): c for c in db.query(StageCapacityDB).all()}
+    cap_compact = {k.replace(" ", ""): c for k, c in cap_by_key.items()}
+
+    def find_cap(name: Optional[str]):
+        """stage_capacity row of a process: exact name, then ignoring spaces / punctuation, then a UNIQUE partial match."""
+        k = _key(name)
+        if not k:
+            return None
+        c = cap_by_key.get(k) or cap_compact.get(k.replace(" ", ""))
+        if c:
+            return c
+        hits = [v for ck, v in cap_by_key.items() if ck and (ck in k or k in ck)]
+        return hits[0] if len(hits) == 1 else None
 
     equipment: Dict[int, List[str]] = defaultdict(list)          # stage_id -> machine_ids
     machine_info: Dict[str, Dict[str, Any]] = {}                  # machine_id -> details
@@ -675,10 +1030,35 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
         if e.stage_id is not None and mid not in equipment[e.stage_id]:
             equipment[e.stage_id].append(mid)
         info = machine_info.setdefault(mid, {"machine_id": mid, "name": e.eqpt_name or mid, "eqpt_no": e.eqpt_no,
+                                             "process_type": e.process_type,
                                              "make": e.eqpt_make, "model": e.eqpt_model,
                                              "workcenter": e.workcenter_name, "stage_ids": []})
         if e.stage_id is not None and e.stage_id not in info["stage_ids"]:
             info["stage_ids"].append(e.stage_id)
+
+    # equipment is normally linked by stage_id = flow_step_id. A process whose flow step has a different id / spelling
+    # (e.g. "BAKING" vs "Baking") would then wrongly look manual - so also match by the step NAME, and by the
+    # equipment's own process_type / workcenter / name.
+    stage_names = {r.flow_step_id: r.step_name for r in db.query(ProcessFlowMaster).all()}
+    eq_by_stage_name: Dict[str, List[str]] = defaultdict(list)
+    for sid_, mids_ in equipment.items():
+        k_ = _key(stage_names.get(sid_))
+        for m_ in mids_:
+            if k_ and m_ not in eq_by_stage_name[k_]:
+                eq_by_stage_name[k_].append(m_)
+    eq_by_label: Dict[str, List[str]] = defaultdict(list)
+    for m_, inf_ in machine_info.items():
+        for lab_ in (inf_.get("process_type"), inf_.get("workcenter"), inf_.get("name")):
+            k_ = _key(lab_)
+            if k_ and m_ not in eq_by_label[k_]:
+                eq_by_label[k_].append(m_)
+
+    def machines_for_step(sid: int, name: str) -> List[str]:
+        k_ = _key(name)
+        for pool in (equipment.get(sid), eq_by_stage_name.get(k_), eq_by_label.get(k_)):
+            if pool:
+                return list(pool)
+        return []
 
     shift_names = [s.name for s in db.query(ShiftDefinition).filter(ShiftDefinition.is_active.is_(True))
                    .order_by(ShiftDefinition.sort_order, ShiftDefinition.id).all()]
@@ -720,7 +1100,12 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
         explicit = False
 
     # ---------------- routing (product_workflow_mapping) + times ----------------
-    part_numbers = {c["part"] for c in selected if c["part"]}
+    # child -> main by serial number; the child POs that are NOT in this schedule are still needed (in process / what-if)
+    serial_links, serial_unmatched = _serial_links(db, cands, role_of, child_of, [c["po"] for c in selected])
+    sel_pos = {c["po"] for c in selected}
+    outside_child_parts = {l["child_part"] for c in selected for l in serial_links.get(c["po"], [])
+                           if l["child_po"] not in sel_pos and l["child_part"]}
+    part_numbers = {c["part"] for c in selected if c["part"]} | outside_child_parts
     routing: Dict[str, list] = defaultdict(list)
     times: Dict[tuple, list] = defaultdict(list)
     if part_numbers:
@@ -757,7 +1142,7 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
         if base is None and getattr(step, "process_time_seconds", None) and step.process_time_seconds > 0:
             base, src = step.process_time_seconds / 3600.0, "routing"
         if base is None:
-            cap = cap_by_key.get(_key(step_name(step)))
+            cap = find_cap(step_name(step))
             if cap and cap.manufacturing_time_mins and cap.manufacturing_time_mins > 0:
                 base, src = float(cap.manufacturing_time_mins) / 60.0, "stage_capacity"
         if base is None and mh <= 0:
@@ -772,7 +1157,7 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
 
     def capacity_for(names: List[str]) -> Optional[Tuple[int, float]]:
         for n in names:
-            c = cap_by_key.get(_key(n))
+            c = find_cap(n)
             if c:
                 sh = int(c.shifts_per_day or 0)
                 hp = float(c.hours_per_shift or 0)
@@ -826,9 +1211,11 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
     start_dt = datetime.combine(start_day, time.min) + timedelta(hours=shift_start)
     downtime = _load_downtime(db, machine_info, start_dt, now, warnings)
     blocks_of = {mid: _merge((e["start"], e["end"]) for e in evs) for mid, evs in downtime.items()}
+    material = _load_consumable_blocks(db, now, start_dt, warnings)     # flow_step_id -> consumable shortages
 
     # ---------------- stations ----------------
     stations: Dict[str, Station] = {}
+    cap_missing: List[str] = []
 
     def make_station(op: Dict[str, Any]) -> Station:
         key = op["key"]
@@ -841,13 +1228,14 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
             s = Station(key, g, "LINE", sids)
             s.steps = [step_name(m) for m in members]
             s.mode = "LINE"
-            with_eq = [(m.flow_step_id, step_name(m)) for m in members if equipment.get(m.flow_step_id)]
-            n = min(len(equipment[i]) for i, _ in with_eq) if with_eq else 1   # as parallel as its narrowest step
+            mach_of = {m.flow_step_id: machines_for_step(m.flow_step_id, step_name(m)) for m in members}
+            with_eq = [(m.flow_step_id, step_name(m)) for m in members if mach_of[m.flow_step_id]]
+            n = min(len(mach_of[i]) for i, _ in with_eq) if with_eq else 1   # as parallel as its narrowest step
             for i in range(n):
-                phys = [(equipment[sid][i], nm) for sid, nm in with_eq]
+                phys = [(mach_of[sid][i], nm) for sid, nm in with_eq]
                 s.options.append({"name": g if n == 1 else f"{g} #{i + 1}",
                                   "resources": [m for m, _ in phys] or [f"LINE-{g}-{i}"], "phys": phys})
-            s.real_machines = [(mid, nm) for sid, nm in with_eq for mid in equipment[sid]]
+            s.real_machines = [(mid, nm) for sid, nm in with_eq for mid in mach_of[sid]]
             s.setup = max([float(cfg[i].setup_minutes or 0) for i in sids if i in cfg], default=0.0)
             s.operators = max(operators_per_shift(i) for i in sids)
             last = cfg.get(sids[-1])
@@ -860,16 +1248,25 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
             if last:
                 s.batch_size = max(int(last.batch_size or DEFAULT_BATCH_SIZE), 1)
                 s.setup = float(last.setup_minutes or 0)
-            mids = list(equipment.get(sid, []))
+            mids = machines_for_step(sid, s.name)
+            rmode = (str(getattr(last, "resource_mode", None) or "AUTO")).upper() if last else "AUTO"
+            if rmode == "MANUAL":                                   # stage_schedule_config.resource_mode forces manual
+                mids = []
+            elif rmode == "MACHINE" and not mids:
+                warnings.append(f"{s.name}: resource_mode is MACHINE but no machine is mapped in equipment_details")
             if mids:
                 s.options = [{"name": mid, "resources": [mid], "phys": [(mid, s.name)]} for mid in mids]
                 s.real_machines = [(mid, s.name) for mid in mids]
             else:
-                s.options = [{"name": "Manual", "resources": [f"MANUAL-{sid}"], "phys": []}]
+                slots = max(int(MANUAL_PARALLEL_SLOTS), 1)          # no machine -> people: several POs can run side by side
+                s.options = [{"name": "", "resources": [f"NO-MACHINE-{sid}-{k}"], "phys": []} for k in range(slots)]
             s.operators = operators_per_shift(sid)
             names = [s.name]
+        # a consumable shortage of ANY step stops the whole process (SMT LINE: the whole line), machine or not
+        s.material = [e for i in sids for e in material.get(i, [])]
+        mat_blocks = [(e["start"], e["end"]) for e in s.material]
         for o in s.options:
-            o["blocks"] = _merge(b for r in o["resources"] for b in blocks_of.get(r, []))
+            o["blocks"] = _merge([b for r in o["resources"] for b in blocks_of.get(r, [])] + mat_blocks)
         if last:
             s.cooldown = float(last.cooldown_minutes or 0)
             s.cd_working_only = bool(last.cooldown_working_time_only)
@@ -877,6 +1274,8 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
         got = capacity_for(names)
         if got:
             s.shifts, s.hps = got
+        if not got:
+            cap_missing.append(s.name)
         s.cap_min = min(s.shifts * s.hps * 60.0, day_cap)
         stations[key] = s
         return s
@@ -884,6 +1283,18 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
     for p in pos:
         for op in p["ops"]:
             make_station(op)
+    no_type = sorted({f"{step_name(m)} (step {m.flow_step_id})" for p in pos for op in p["ops"] for m in op["steps"]
+                      if not op["line"] and batch_rule.get(m.flow_step_id, (None, ""))[0] is None})
+    if no_type:
+        warnings.append("No process_type row (batch / series not set) - scheduled as series, one PO block: "
+                        + ", ".join(no_type) + ". If one of them is a batch process, add it to process_type with "
+                        "process_type_batch = true (stage_id = flow_step_id). Check: /schedule/po-gantt/process-check")
+    for cpart in outside_child_parts:                   # child POs outside the schedule (only for estimates)
+        for op in ops_for(cpart):
+            make_station(op)
+    if cap_missing:
+        warnings.append(f"No stage_capacity row matches: {', '.join(dict.fromkeys(cap_missing))} - default "
+                        f"{DEFAULT_SHIFTS} shifts x {DEFAULT_HOURS_PER_SHIFT:g} h used (add the process name to stage_capacity)")
 
     # ---------------- run time of one operation ----------------
     missing_time: Dict[str, List[str]] = defaultdict(list)
@@ -900,7 +1311,9 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
             return math.ceil(qty / bs) * t, t
         return qty * t, t
 
-    def op_minutes(p: Dict[str, Any], op: Dict[str, Any], s: Station) -> float:
+    def op_minutes_and_parts(p: Dict[str, Any], op: Dict[str, Any], s: Station):
+        """Minutes of one operation for the whole PO, and (PO minutes, first board / batch minutes) of each step in it.
+        SMT LINE: the steps run one after the other, so the line time is the SUM of its steps."""
         parts = []
         for st in op["steps"]:
             m = step_minutes(p["part"], st, p["qty"])
@@ -908,37 +1321,77 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
                 missing_time[p["part"]].append(step_name(st))
                 m = (FALLBACK_MINUTES, FALLBACK_MINUTES)
             parts.append(m)
-        if len(parts) == 1:
-            total = parts[0][0]
-        else:                                               # flow line: bottleneck + one board through the rest
-            b = max(range(len(parts)), key=lambda i: parts[i][0])
-            total = parts[b][0] + sum(parts[i][1] for i in range(len(parts)) if i != b)
-        return max(total + s.setup, 1.0)
+        total = sum(m[0] for m in parts) if s.kind == "LINE" else parts[0][0]
+        return max(total + s.setup, 1.0), parts
 
-    # ---------------- child PO -> main PO supply (FIFO by quantity) ----------------
+    # ---------------- child PO -> main PO ----------------
+    # 1. by SERIAL number: the main PCB needs the child PCB with the same serial (as the assign step checks it).
+    #    child PO in this schedule          -> the main PO waits for it
+    #    child PO outside, PCBs done        -> nothing to wait for
+    #    child PO outside, PCBs in process  -> the main PO waits for the estimated end of the child (rest of its flow)
+    #    child PO outside, NOT assigned     -> the main PO is scheduled without waiting (FORCED) + "assign the child on
+    #                                          day X -> main can start on day Y" message
+    # 2. main POs without any serial match: first come, first served by quantity (as before).
     depends_on: Dict[str, List[str]] = defaultdict(list)
+    link_by: Dict[str, str] = {}                                    # main po -> "serial" | "quantity"
+    outside_links: Dict[str, List[Dict[str, Any]]] = defaultdict(list)   # main po -> child links outside the schedule
     by_part: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for p in pos:
         by_part[p["part"]].append(p)
+    in_plan = {p["po"] for p in pos}
+    # main PCBs with NO child PCB anywhere (no child PO / child POs used up / no serial match): the main PO is scheduled
+    # without them = FORCED, the same as a child that is not assigned yet
+    missing_child: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    why_text = {"no_child_po": "no open child PO of part {cp}",
+                "short": "the open child POs of part {cp} are used up by earlier main POs",
+                "no_serial_match": "no child PCB has the same serial number"}
+
+    def no_child(m: Dict[str, Any], cp: Optional[str], n: int, reason: str) -> None:
+        missing_child[m["po"]].append({"child_po": None, "child_part": cp, "pcbs": n, "done": 0, "in_progress": 0,
+                                       "not_assigned": n, "in_plan": False, "forced": True, "reason": reason})
+        warnings.append(f"PO {m['po']} ({m['label']}): {n} main PCB(s) have no child PCB - "
+                        + why_text[reason].format(cp=cp or "?")
+                        + " - the main PO is scheduled without them (forced). It can only really start when those child "
+                          "PCBs are made: release / assign a child PO" + (f" of part {cp}" if cp else "") + ".")
+
+    taken_by_serial: Dict[str, int] = defaultdict(int)             # child po -> PCBs already linked by serial
+    for m in pos:
+        links = serial_links.get(m["po"], [])
+        if not links:
+            continue
+        link_by[m["po"]] = "serial"
+        for l in links:
+            taken_by_serial[l["child_po"]] += l["pcbs"]
+            if l["child_po"] in in_plan:
+                depends_on[m["po"]].append(l["child_po"])
+            else:
+                outside_links[m["po"]].append(l)
+        if serial_unmatched.get(m["po"]):
+            no_child(m, child_of.get(m["part"]), serial_unmatched[m["po"]], "no_serial_match")
     for main_pn, child_pn in child_of.items():
-        mains, childs = by_part.get(main_pn, []), by_part.get(child_pn, [])
+        mains = [m for m in by_part.get(main_pn, []) if m["po"] not in link_by]
+        childs = by_part.get(child_pn, [])
         if not mains:
             continue
         if not childs:
-            warnings.append(f"Part {main_pn}: no child PO ({child_pn}) loaded - child PCBs assumed in stock, "
-                            f"main PO(s) {', '.join(m['label'] for m in mains)} start right away")
+            for m in mains:
+                link_by[m["po"]] = "quantity"
+                no_child(m, child_pn, m["qty"], "no_child_po")
             continue
         supply, run = [], 0
         for c in childs:
-            supply.append((run, run + c["qty"], c["po"]))
-            run += c["qty"]
+            free = max(c["qty"] - taken_by_serial.get(c["po"], 0), 0)
+            if free:
+                supply.append((run, run + free, c["po"]))
+                run += free
         need = 0
         for m in mains:
             lo, hi = need, need + m["qty"]
             need = hi
             depends_on[m["po"]] = [cpo for (a, b, cpo) in supply if a < hi and b > lo]
-            if hi > run:
-                warnings.append(f"PO {m['po']}: needs more child PCBs than the loaded child POs provide - rest assumed in stock")
+            link_by[m["po"]] = "quantity"
+            if hi > run:                                     # the open child POs run out before this main PO
+                no_child(m, child_pn, hi - max(run, lo), "short")
 
     def depth(part: str) -> int:
         d = 0
@@ -946,9 +1399,29 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
             part, d = child_of[part], d + 1
         return d
 
+    # ---------------- chains: a child PO and the main PO(s) it feeds belong together ----------------
+    parent = {p["po"]: p["po"] for p in pos}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for m_po, c_pos in depends_on.items():
+        for c_po in c_pos:
+            if c_po in parent and m_po in parent:
+                parent[find(c_po)] = find(m_po)
+    chain_first: Dict[str, int] = {}
+    for p in pos:
+        r = find(p["po"])
+        chain_first[r] = min(chain_first.get(r, p["idx"]), p["idx"])
+    chain_key = {p["po"]: chain_first[find(p["po"])] for p in pos}        # chain = its first PO (load order)
+    chain_no = {k: i + 1 for i, k in enumerate(sorted(set(chain_key.values())))}
+
     # ---------------- schedule (finite capacity, machines shared, down-time skipped) ----------------
     default_cap = min(DEFAULT_SHIFTS * DEFAULT_HOURS_PER_SHIFT * 60.0, day_cap)
-    free_at: Dict[str, datetime] = defaultdict(lambda: datetime.min)
+    busy: Dict[str, List[Tuple[datetime, datetime, str]]] = defaultdict(list)   # resource -> runs already booked (first-fit gaps)
     usage: Dict[str, Dict[date, Dict[str, float]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
     segments: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     machine_segments: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -959,55 +1432,212 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
     route: Dict[str, List[str]] = defaultdict(list)
     delayed_by_downtime: Dict[str, set] = defaultdict(set)
 
-    for p in sorted(pos, key=lambda x: (ROLES.index(x["role"]), depth(x["part"]), x["idx"])):
-        prev_ready = max([start_dt] + [po_ready[c] for c in depends_on.get(p["po"], []) if c in po_ready])
-        for seq, op in enumerate(p["ops"], start=1):
-            st = stations[op["key"]]
-            minutes = op_minutes(p, op, st)
+    # placement order: a main PO is placed immediately after the last child PO that feeds it (child, main, child, main ...)
+    # - NOT "all children first", which pushed every main behind all the child work on shared machines.
+    by_po = {p["po"]: p for p in pos}
+    kids = {m: [c for c in cs if c in by_po] for m, cs in depends_on.items()}
+    feeds: Dict[str, List[str]] = defaultdict(list)
+    for m_po, cs in kids.items():
+        for c_po in cs:
+            feeds[c_po].append(m_po)
+    order: List[Dict[str, Any]] = []
+    placed_po: set = set()
 
-            best = None
-            for mi, o in enumerate(st.options):
-                s0 = max([prev_ready] + [free_at[r] for r in o["resources"]])
-                if st.kind == "LINE":
+    def emit(p: Dict[str, Any]) -> None:
+        if p["po"] in placed_po:
+            return
+        placed_po.add(p["po"])
+        for c_po in kids.get(p["po"], []):
+            emit(by_po[c_po])
+        order.append(p)
+        for m_po in feeds.get(p["po"], []):
+            if m_po not in placed_po and all(c in placed_po for c in kids[m_po]):
+                emit(by_po[m_po])
+
+    for p in sorted(pos, key=lambda x: x["idx"]):
+        emit(p)
+    handoff: Dict[str, Dict[str, Any]] = {}
+
+    open_batches: Dict[str, List[Dict[str, Any]]] = defaultdict(list)   # station key -> batches already booked (for co-loading)
+
+    def book(st: Station, ready: datetime, minutes: float, one_day: bool = False, dry=None):
+        """First fit on every machine (option) of the station: the earliest start >= ready where the whole run clears the runs
+        already booked there and the machine's down-time. The machine that FINISHES first wins.
+        one_day = the run must sit inside one free stretch of one working day (SMT LINE, an oven batch).
+        dry = bookings of a trial run (estimates) - looked at, but never kept.
+        Returns (mi, o, start, end, end_day, pieces, fits_in_one_day, blocked_by)."""
+        best = None
+        for mi, o in enumerate(st.options):
+            booked = sorted(iv for r in o["resources"] for iv in busy[r] + (dry.get(r, []) if dry is not None else []))
+            s0, first_block = ready, None
+            for _ in range(100000):
+                if one_day:
                     s, e, eday, segs, same = cal.place_within_day(s0, minutes, st.cap_min, o["blocks"])
                 else:
-                    (s, e, eday, segs), same = cal.consume(s0, minutes, st.cap_min, o["blocks"]), True
-                if best is None or e < best[4]:
-                    best = (mi, o, s0, s, e, eday, segs, same)
-            mi, o, s0, s, e, eday, segs, same = best
-            for r in o["resources"]:
-                free_at[r] = e
-            if o["blocks"] and any(a < e and b > s0 for a, b in o["blocks"]):
-                delayed_by_downtime[p["po"]].add(st.name)
-            if not same:
-                warnings.append(f"PO {p['po']} ({p['label']}): {st.name} needs {minutes / 60:.1f} h, more than one "
-                                f"free working day ({st.cap_min / 60:g} h) - the run is spread over several days")
+                    s, e, eday, segs = cal.consume(s0, minutes, st.cap_min, o["blocks"])
+                    same = True
+                clash = next((iv for iv in booked if iv[0] < e and iv[1] > s), None)
+                if clash is None:
+                    break
+                if first_block is None:
+                    first_block = clash[2]
+                s0 = clash[1]
+            else:
+                raise PoGanttError(500, f"No free slot found on {o['name'] or st.name}")
+            if best is None or e < best[3]:
+                best = (mi, o, s, e, eday, segs, same, first_block)
+        return best
 
+    def reserve(o: Dict[str, Any], s: datetime, e: datetime, label: str, dry=None) -> None:
+        for r in o["resources"]:
+            (busy if dry is None else dry).setdefault(r, []).append((s, e, label))
+
+    def add_segment(p: Dict[str, Any], st: Station, row_id: str, mi: int, o: Dict[str, Any], piece, s: datetime, e: datetime,
+                    phys: List[Tuple[str, str]], extra: Dict[str, Any]) -> None:
+        """One bar of the Gantt (one PO, one day, one machine / step) + the same bar on each machine row."""
+        d, a, b, m = piece
+        seg = {
+            "label": p["label"], "po": p["po"], "part": p["part"], "role": p["role"], "quantity": p["qty"],
+            "machine": o["name"], "machine_no": mi, "machines": [mid for mid, _ in phys], "operation": st.name,
+            "row_id": row_id, "date": d.isoformat(), "start": _iso(a), "end": _iso(b), "minutes": round(m, 1),
+            "run_start": _iso(s), "run_end": _iso(e),
+        }
+        seg.update(extra)
+        segments[st.key].append(seg)
+        for mid, nm in phys:
+            machine_segments[mid].append({**seg, "machine": mid, "step": nm})
+        usage[st.key][d][p["label"]] += m
+
+    def split_steps(segs, step_mins: List[float]):
+        """Cut a line run [(day, a, b, minutes)] into its steps, one after the other -> [(step_index, (day, a, b, minutes))]."""
+        out, i, left, n = [], 0, step_mins[0], len(step_mins)
+        for d, a, b, m in segs:
+            while m > 1e-9:
+                while left <= 1e-9 and i < n - 1:          # a step with no time: go to the next one
+                    i += 1
+                    left = step_mins[i]
+                use = m if i == n - 1 else min(m, left)    # the last step takes whatever is left (rounding)
+                out.append((i, (d, a, a + timedelta(minutes=use), use)))
+                a, m, left = a + timedelta(minutes=use), m - use, left - use
+        return out
+
+    def place_batches(p: Dict[str, Any], st: Station, parts, ready: datetime, row_id: str, dry=None):
+        """Batch process: batch_size PCBs go in together and come out together (one bar per batch).
+        70 PCBs / batch 30 -> 30 + 30 + 10. Batches of one PO run side by side on free ovens.
+        A batch of the SAME part that still has room, is not started before this PO is ready and does not finish later
+        than a new batch would, takes the PCBs instead (co-loading). A trial run (dry) never co-loads.
+        Returns (start, end, end_day, machine names, blocked_by)."""
+        size = batch_size_for(p["part"], st.step_ids[0])
+        per_batch = parts[0][1]                                   # minutes for one batch (time of a batch, not per PCB)
+        left, mine, blocked_by = p["qty"], [], None
+        while left > 0:
+            mins = per_batch + (st.setup if not mine else 0.0)
+            mi, o, s, e, eday, segs, same, blocked = book(st, ready, mins, one_day=True, dry=dry)
+            join = None
+            if dry is None:
+                join = min((b for b in open_batches[st.key]
+                            if b["part"] == p["part"] and b["room"] > 0 and b["start"] >= ready and b["end"] <= e),
+                           key=lambda b: b["start"], default=None)
+            if join:
+                take = min(left, join["room"])
+                join["room"] -= take
+                mi, o, s, e, eday, segs = join["mi"], join["o"], join["start"], join["end"], join["eday"], join["segs"]
+                together = join["together"]
+            else:
+                take = min(left, size)
+                reserve(o, s, e, p["label"], dry)
+                together = []
+                if dry is None:
+                    open_batches[st.key].append({"part": p["part"], "room": size - take, "start": s, "end": e, "eday": eday,
+                                                 "mi": mi, "o": o, "segs": segs, "together": together})
+                    if blocked_by is None:
+                        blocked_by = blocked
+                    if o["blocks"] and any(a < e and b > ready for a, b in o["blocks"]):
+                        delayed_by_downtime[p["po"]].add(st.name)
+                    if not same:
+                        warnings.append(f"PO {p['po']} ({p['label']}): one {st.name} batch needs {mins / 60:.1f} h, more than "
+                                        f"one working day ({st.cap_min / 60:g} h) - the batch is spread over several days")
+            together.append({"label": p["label"], "po": p["po"], "qty": take})   # every PO inside this batch (shared list)
+            left -= take
+            mine.append((mi, o, s, e, eday, segs, take, mins, together))
+        if dry is None:
+            for k, (mi, o, s, e, eday, segs, take, mins, together) in enumerate(mine, start=1):
+                info = {"no": k, "count": len(mine), "qty": take, "size": size, "minutes": round(mins, 1),
+                        "start": _iso(s), "end": _iso(e), "together": together}
+                for piece in segs:
+                    add_segment(p, st, row_id, mi, o, piece, s, e, o["phys"], {"batch": info})
+        s_all, e_all = min(b[2] for b in mine), max(b[3] for b in mine)
+        last = max(mine, key=lambda b: b[3])
+        names = list(dict.fromkeys(b[1]["name"] for b in mine if b[1]["name"]))
+        return s_all, e_all, last[4], ", ".join(names), blocked_by
+
+    def run_po(p: Dict[str, Any], ready: datetime, dry=None) -> Tuple[Optional[datetime], datetime]:
+        """Place a PO through its operations (p["ops"]), one after the other, from `ready`.
+        dry = None: book it into the schedule. dry = {}: a trial run on top of the schedule (estimate only, nothing kept).
+        Returns (start of its first operation, when the PO is ready for the next step / the main PO)."""
+        ready0, first_start = ready, None
+        for seq, op in enumerate(p["ops"], start=1):
+            st = stations[op["key"]]
+            minutes, parts = op_minutes_and_parts(p, op, st)
             row_id = f"{p['role']}:{st.key}"
-            phys_ids = [m for m, _ in o["phys"]]
-            for d, a, b, m in segs:
-                usage[st.key][d][p["label"]] += m
-                seg = {
-                    "label": p["label"], "po": p["po"], "part": p["part"], "role": p["role"], "quantity": p["qty"],
-                    "machine": o["name"], "machine_no": mi, "machines": phys_ids, "operation": st.name,
-                    "row_id": row_id, "date": d.isoformat(), "start": _iso(a), "end": _iso(b), "minutes": round(m, 1),
-                    "run_start": _iso(s), "run_end": _iso(e),
-                }
-                segments[st.key].append(seg)
-                for mid, nm in o["phys"]:
-                    machine_segments[mid].append({**seg, "machine": mid, "step": nm})
-            span = runs.setdefault((st.key, p["label"]), [s, e])
-            span[0], span[1] = min(span[0], s), max(span[1], e)
-            ps = po_span.setdefault(p["po"], [s, e])
-            ps[0], ps[1] = min(ps[0], s), max(ps[1], e)
-            if row_id not in route[p["po"]]:
-                route[p["po"]].append(row_id)
-            run_list.append({"seq": seq, "label": p["label"], "po": p["po"], "part": p["part"], "role": p["role"],
-                             "quantity": p["qty"], "row_id": row_id, "station": st.name, "kind": st.kind,
-                             "flow_step_ids": st.step_ids, "machine": o["name"], "machines": phys_ids,
-                             "start": _iso(s), "end": _iso(e), "minutes": round(minutes, 1)})
 
-            ready = e                                            # when the PO may enter the next station
+            if st.mode == "BATCH":
+                # -------- batch process: one bar per batch --------
+                s, e, eday, machine_text, blocked_by = place_batches(p, st, parts, ready, row_id, dry)
+                phys_ids = []
+            else:
+                # -------- normal process / SMT LINE: the whole PO in one run --------
+                mi, o, s, e, eday, segs, same, blocked_by = book(st, ready, minutes, one_day=(st.kind == "LINE"), dry=dry)
+                reserve(o, s, e, p["label"], dry)
+                machine_text = o["name"]
+                phys_ids = [m for m, _ in o["phys"]]
+                if dry is None:
+                    if o["blocks"] and any(a < e and b > ready for a, b in o["blocks"]):
+                        delayed_by_downtime[p["po"]].add(st.name)
+                    if not same:
+                        warnings.append(f"PO {p['po']} ({p['label']}): {st.name} needs {minutes / 60:.1f} h, more than one "
+                                        f"working day ({st.cap_min / 60:g} h) - the run is spread over several days")
+                    if st.kind == "LINE":
+                        # the line steps run ONE AFTER THE OTHER (step 1 for the whole PO, then step 2 ...), all inside the day
+                        step_mins = [parts[i][0] + (st.setup if i == 0 else 0.0) for i in range(len(parts))]
+                        pieces = split_steps(segs, step_mins)
+                        for i, name in enumerate(st.steps):
+                            mine = [pc for k, pc in pieces if k == i]
+                            if not mine:
+                                continue
+                            step_phys = [(mid, nm) for mid, nm in o["phys"] if nm == name]
+                            extra = {"step": name, "step_no": i + 1, "step_count": len(st.steps),
+                                     "step_start": _iso(mine[0][1]), "step_end": _iso(mine[-1][2]),
+                                     "step_minutes": round(step_mins[i], 1)}
+                            if step_phys:
+                                extra["machine"] = step_phys[0][0]
+                            for piece in mine:
+                                add_segment(p, st, row_id, mi, o, piece, s, e, step_phys, extra)
+                    else:
+                        for piece in segs:
+                            add_segment(p, st, row_id, mi, o, piece, s, e, o["phys"], {})
+
+            first_start = s if first_start is None else first_start
+            if dry is None:
+                if seq == 1 and any(c in po_ready for c in depends_on.get(p["po"], [])):   # main PO: how soon after its child?
+                    wait_h = max((s - ready0).total_seconds() / 3600.0, 0.0)
+                    handoff[p["po"]] = {"child_ready": _iso(ready0), "main_start": _iso(s), "wait_hours": round(wait_h, 1),
+                                        "station": st.name, "machine": machine_text, "blocked_by": blocked_by}
+                    if wait_h > HANDOFF_WARN_HOURS:
+                        warnings.append(f"PO {p['po']} ({p['label']}) starts {wait_h / 24:.1f} days after its child PO "
+                                        f"finished: {st.name} is busy" + (f" with PO {blocked_by}" if blocked_by else ""))
+                span = runs.setdefault((st.key, p["label"]), [s, e])
+                span[0], span[1] = min(span[0], s), max(span[1], e)
+                ps = po_span.setdefault(p["po"], [s, e])
+                ps[0], ps[1] = min(ps[0], s), max(ps[1], e)
+                if row_id not in route[p["po"]]:
+                    route[p["po"]].append(row_id)
+                run_list.append({"seq": seq, "label": p["label"], "po": p["po"], "part": p["part"], "role": p["role"],
+                                 "quantity": p["qty"], "row_id": row_id, "station": st.name, "kind": st.kind,
+                                 "flow_step_ids": st.step_ids, "machine": machine_text, "machines": phys_ids,
+                                 "start": _iso(s), "end": _iso(e), "minutes": round(minutes, 1)})
+
+            ready = e                                            # when the PO may enter the next process
             if st.next_day_release:
                 ready = datetime.combine(cal.first_working_day(eday + timedelta(days=1)), time.min) + timedelta(hours=shift_start)
             if st.cooldown > 0:
@@ -1015,15 +1645,67 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
                     ready = cal.consume(ready, st.cooldown, default_cap)[1]
                 else:
                     ready = ready + timedelta(minutes=st.cooldown)
-            prev_ready = ready
-        po_ready[p["po"]] = prev_ready
+        return first_start, ready
+
+    def outside_child(l: Dict[str, Any], qty: int, from_step: bool) -> Dict[str, Any]:
+        """A child PO that is not in this schedule, as a PO for a trial run: its whole flow, or (in process) the rest of
+        its flow from the earliest step its PCBs are at."""
+        ops = ops_for(l["child_part"])
+        if from_step and l["steps"]:
+            at = [i for i, op in enumerate(ops) if any(m.flow_step_id in l["steps"] for m in op["steps"])]
+            ops = ops[min(at):] if at else ops
+        return {"po": l["child_po"], "label": l["child_po"], "part": l["child_part"], "qty": qty, "role": "CHILD", "ops": ops}
+
+    child_notes: Dict[str, List[Dict[str, Any]]] = defaultdict(list)   # main po -> what the child outside the plan means
+    forced: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []          # (main PO, child link) scheduled without waiting
+
+    for p in order:
+        waits = [po_ready[c] for c in depends_on.get(p["po"], []) if c in po_ready]
+        child_notes[p["po"]].extend(missing_child.get(p["po"], []))
+        for l in outside_links.get(p["po"], []):
+            note = {"child_po": l["child_po"], "child_part": l["child_part"], "pcbs": l["pcbs"], "done": l["done"],
+                    "in_progress": l["in_progress"], "not_assigned": l["not_assigned"], "in_plan": False}
+            if l["in_progress"]:
+                # child PCBs are on the floor: the main waits for the rest of the child flow (estimate, nothing booked)
+                trial = outside_child(l, l["in_progress"], from_step=True)
+                if trial["ops"]:
+                    _, est = run_po(trial, max(now, start_dt), dry={})
+                    waits.append(est)
+                    note["child_ready_estimate"] = _iso(est)
+                    warnings.append(f"PO {p['po']} ({p['label']}): {l['in_progress']} child PCB(s) of PO {l['child_po']} are "
+                                    f"still in process - estimated done {est:%d-%m-%Y %H:%M}, the main PO waits for that")
+            if l["not_assigned"]:
+                note["forced"] = True
+                forced.append((p, l))
+            child_notes[p["po"]].append(note)
+        _, po_ready[p["po"]] = run_po(p, max([start_dt] + waits))
+
+    # child not assigned -> main was scheduled without waiting. What if the child is assigned on the first working day?
+    for p, l in forced:
+        trial = outside_child(l, l["not_assigned"], from_step=False)
+        note = next(n for n in child_notes[p["po"]] if n["child_po"] == l["child_po"])
+        main_start = po_span[p["po"]][0]
+        if not trial["ops"]:
+            warnings.append(f"PO {p['po']} ({p['label']}): child PO {l['child_po']} is not assigned yet and its part "
+                            f"{l['child_part']} has no flow - main PO scheduled without waiting for it (forced)")
+            continue
+        c_start, c_end = run_po(trial, start_dt, dry={})
+        note.update({"assign_on": _iso(c_start), "child_done": _iso(c_end), "main_can_start": _iso(c_end),
+                     "main_planned_start": _iso(main_start)})
+        warnings.append(
+            f"PO {p['po']} ({p['label']}): child PO {l['child_po']} ({l['not_assigned']} PCB(s)) is not assigned yet - the "
+            f"main PO is scheduled without waiting for it (forced, from {main_start:%d-%m-%Y %H:%M}). If child PO "
+            f"{l['child_po']} is assigned on {c_start:%d-%m-%Y}, it is done by {c_end:%d-%m-%Y %H:%M} and PO {p['po']} "
+            f"can start from {c_end:%d-%m-%Y %H:%M}"
+            + (" - until then its PCBs cannot be assigned (the child must be complete)." if c_end > main_start else "."))
 
     for part, names in missing_time.items():
         uniq = list(dict.fromkeys(names))
         warnings.append(f"Part {part}: no process time for {len(uniq)} step(s) "
                         f"[{', '.join(uniq[:6])}{'...' if len(uniq) > 6 else ''}] - {FALLBACK_MINUTES:g} min used")
     if delayed_by_downtime:
-        warnings.append(f"{len(delayed_by_downtime)} PO(s) were moved around machine breakdowns / maintenance")
+        warnings.append(f"{len(delayed_by_downtime)} PO(s) were moved around machine breakdowns / maintenance / "
+                        f"consumable shortages")
 
     # ---------------- days ----------------
     used_days = [d for per_day in usage.values() for d in per_day]
@@ -1090,8 +1772,12 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
                 for lb, v in sorted(out, key=lambda kv: (kv[1][0], label_idx.get(kv[0], 0)))]
 
     def station_downtime(s: Station) -> List[Dict[str, Any]]:
-        evs = [_dt_json({**e, "machine_name": machine_info.get(mid, {}).get("name", mid)})
+        step_of = {m: nm for m, nm in s.real_machines}                 # SMT LINE: which step the machine belongs to
+        evs = [_dt_json({**e, "machine_name": machine_info.get(mid, {}).get("name", mid),
+                         "step": step_of[mid] if s.kind == "LINE" else None})
                for mid in dict.fromkeys(m for m, _ in s.real_machines) for e in downtime.get(mid, [])]
+        sname = dict(zip(s.step_ids, s.steps)) if s.kind == "LINE" else {}
+        evs += [_dt_json({**e, "process": s.name, "step": sname.get(e["stage_id"])}) for e in s.material]
         return sorted(evs, key=lambda e: e["start"])
 
     rows: List[Dict[str, Any]] = []
@@ -1107,7 +1793,10 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
                 "shifts": s.shifts, "mins_per_shift": int(s.hps * 60), "machines": len(s.options),
                 "machine_names": s.machines, "has_machine": bool(real), "real_machines": real,
                 "real_machine_names": [machine_info[m]["name"] for m in real],
-                "operators_per_shift": s.operators, "process_mode": s.mode,
+                "operators_per_shift": s.operators, "process_mode": s.mode, "is_batch": s.mode == "BATCH",
+                "batch_why": batch_rule.get(s.step_ids[0], (None, ""))[1] if s.kind != "LINE" else None,
+                "batch_size": batch_size_for(parts[0], s.step_ids[0]) if s.mode == "BATCH" else None,
+                "day_end_hour": round(shift_start + s.cap_min / 60.0, 2),
                 "shared_with": [r for r in ROLES if r != role and r in roles_of_station[key]],
                 "cells": cells_for(key, role), "po_runs": runs_for(key, role),
                 "segments": [sg for sg in segments.get(key, []) if sg["role"] == role],
@@ -1133,12 +1822,26 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
                 "make": info.get("make"), "model": info.get("model"), "workcenter": info.get("workcenter"),
                 "group": s.key, "group_name": s.name, "group_kind": s.kind, "step": step if s.kind == "LINE" else None,
                 "processes": [s.name], "roles": [row["role"]], "shifts": s.shifts,
+                "day_end_hour": round(shift_start + s.cap_min / 60.0, 2), "is_batch": s.mode == "BATCH",
                 "segments": segs, "downtime": [_dt_json(e) for e in downtime.get(mid, [])],
-                "busy_minutes": round(sum(x["minutes"] for x in segs), 1),
+                # a batch shared by 2 POs is 2 bars at the same time - count the oven time once
+                "busy_minutes": round(sum({(x["start"], x["end"]): x["minutes"] for x in segs}.values()), 1),
             }
             placed[mid] = mr
             machine_rows.append(mr)
     manual_processes = [r["name"] for r in rows if not r["has_machine"]]
+    if manual_processes:
+        warnings.append("No machine mapped in equipment_details for: " + ", ".join(
+            dict.fromkeys(f"{r['name']} (step {', '.join(str(x) for x in r['flow_step_ids'])})" for r in rows if not r["has_machine"])))
+
+    for s in stations.values():
+        for e in s.material:
+            warnings.append(f"Consumable not available - {s.name} does not run from {e['start']:%d-%m-%Y %H:%M} to "
+                            f"{e['end']:%d-%m-%Y %H:%M}: {e['note']}")
+
+    # most important first: forced main POs, consumable shortages, children still in process
+    first = ("is not assigned yet", "have no child PCB", "Consumable not available", "still in process", "Breakdown repair waits")
+    warnings.sort(key=lambda w: next((i for i, k in enumerate(first) if k in w), len(first)))
 
     all_down = [_dt_json({**e, "machine_name": machine_info.get(mid, {}).get("name", mid)})
                 for mid in placed for e in downtime.get(mid, [])]
@@ -1147,23 +1850,35 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
     line_text = "; ".join(f"{g} = {', '.join(n)}" for g, n in LINE_GROUPS.items())
     assumptions = [
         "Child / main comes from product_type_master (sub product type); a main part is fed by the child part of the same product type.",
-        "Each part follows its flow from product_workflow_mapping (step sequence). Child POs are scheduled first; "
+        "Each part follows its flow from product_workflow_mapping (step sequence). Linked child / main POs are scheduled as one chain; "
         "a main PO starts after the child PO(s) that feed it are finished.",
+        "Child -> main link by SERIAL number first (PcbData.serialNo, the same check as PCB assignment): the main PCB needs the "
+        "child PCB with the same serial. Main POs without a serial match use first come, first served by quantity.",
+        "Child PO not in this schedule: PCBs done -> no wait; in process (pcb_assignment.current_step_id) -> the main waits for "
+        "the estimated end of the rest of the child flow; NOT assigned -> the main is scheduled without waiting (forced) and "
+        "the warning says on which day the child must be assigned and from when the main can really start.",
         "Unit of work is the whole PO quantity; a PO moves through its processes as a block.",
-        f"Line processes run in one go inside one working day ({line_text}). "
-        "Line time = slowest step for the whole PO + one board through the other steps.",
+        f"Line processes run inside one working day ({line_text}). The steps run one after the other "
+        "(step 1 for the whole PO, then step 2 ...); line time = sum of the step times.",
         "Machines come from equipment_details; the same machine serving several processes is shared between them.",
         "Machine breakdowns (machine_breakdown_logs: until ready date, else + downtime hours, else open = "
         f"{OPEN_BREAKDOWN_HOURS:g} h from now) and pending preventive maintenance (maintenance_schedules: the whole day) "
         "block the machine.",
+        "Spares (inventorty_spares): an open breakdown whose machine has a spare out of stock lasts at least the spare's "
+        f"procurement lead time (default {DEFAULT_SPARE_LEAD_DAYS} d). A running machine is not blocked by a missing spare (warning only).",
+        "Consumables (consumables, by process): out of stock or past shelf life -> the process (all its machines, or the "
+        f"process without machine) is blocked for {CONSUMABLE_RESTOCK_DAYS} days; stock that expires blocks it from the day "
+        "after expiry. Stock is checked as available yes / no (the table has no use per PCB). Low stock = warning.",
         f"Shifts per process come from stage_capacity (default {DEFAULT_SHIFTS} x {DEFAULT_HOURS_PER_SHIFT:g} h); "
         f"the working day runs {_hm(shift_start)} - {_hm(DAY_END_HOUR)} at most.",
         "Off days: Sundays, 1st and 3rd Saturdays, public holidays and calendar 'Holiday' exceptions; "
         "'Working' reopens a day, 'Half-Day' halves it.",
         f"Time per unit = {'actual' if time_source == 'actual' else 'SAP'} time (fallback to the other, routing, stage_capacity) "
         "+ machine hours of part_process_time.",
-        "Batch stages: number of batches = ceil(quantity / batch size); batch size = part_process_time.batch_size, "
-        "else the stage setting, else 30.",
+        "Batch processes (process_type.process_type_batch): batch size PCBs go in together and come out together - "
+        "70 PCBs / batch 30 = 3 batches (30, 30, 10), each one bar, run on free machines side by side. "
+        "A batch of the same part with room left takes PCBs of the next PO when that does not delay it. "
+        "Batch size = part_process_time.batch_size, else stage_schedule_config.batch_size, else 30.",
         f"Plant filter: only POs, machines and process times of plant {plant or '(all)'}.",
         "Operators per shift is informational; it does not limit the schedule.",
     ]
@@ -1180,8 +1895,13 @@ def build_po_gantt(db: Session, production_orders: Optional[List[str]] = None, p
             "machines_down": len({e["machine"] for e in all_down}),
             "downtime_events": len(all_down),
             "manual_processes": manual_processes,
+            "material_shortages": [_dt_json({**e, "process": s.name}) for s in stations.values() for e in s.material],
             "pos": [{"label": p["label"], "production_order": p["po"], "part_number": p["part"], "role": p["role"],
-                     "quantity": p["qty"], "depends_on": depends_on.get(p["po"], []), "route": route[p["po"]],
+                     "quantity": p["qty"], "depends_on": depends_on.get(p["po"], []), "handoff": handoff.get(p["po"]), "route": route[p["po"]],
+                     "chain": chain_no[chain_key[p["po"]]],
+                     "link_by": link_by.get(p["po"]),                         # serial | quantity | None (not a main PO)
+                     "child_outside": child_notes.get(p["po"], []),           # child POs not in this schedule
+                     "forced": any(n.get("forced") for n in child_notes.get(p["po"], [])),
                      "moved_by_downtime": sorted(delayed_by_downtime.get(p["po"], [])),
                      "start": _iso(po_span[p["po"]][0]), "end": _iso(po_span[p["po"]][1])} for p in pos],
         },
@@ -1451,7 +2171,7 @@ def compare_plan(db: Session, plan_id: int, now: Optional[datetime] = None) -> D
             "current_status": current["status"] if current else None,
             "processes_done": sum(1 for i in items if i["status"].startswith("DONE")), "processes": len(items),
             "late_processes": sum(1 for i in items if i["status"] in ("DONE_LATE", "RUNNING_LATE", "START_OVERDUE")),
-            "depends_on": m.get("depends_on", []),
+            "depends_on": m.get("depends_on", []), "handoff": m.get("handoff"),
         })
     order = {p["production_order"]: i for i, p in enumerate(snap.get("meta", {}).get("pos", []))}
     pos_out.sort(key=lambda p: order.get(p["po"], 10 ** 6))
@@ -1560,8 +2280,7 @@ def build_po_gantt_xlsx(result: Dict[str, Any]) -> bytes:
         a.font, a.border = font(bold=True), border
         if st.get("has_machine"):
             a.fill = machine_fill
-        b = ws.cell(row=r, column=2, value=f"{st['shifts']} shift · {len(st.get('real_machines') or []) or 'manual'}"
-                                           + (" m/c" if st.get("real_machines") else ""))
+        b = ws.cell(row=r, column=2, value=f"{st['shifts']} shift" + (f" · {len(st['real_machines'])} m/c" if st.get("real_machines") else ""))
         b.font, b.border, b.alignment = font(), border, center
         day_cells(ws, r, st["segments"], [])
         r += 1
@@ -1629,6 +2348,10 @@ def create_po_gantt_router(init_db, verify_token=None, engine=None) -> APIRouter
         return _guard(lambda: build_po_gantt(db, production_order, plant, start_date, time_source, label_mode,
                                              show_holidays, shift_start))
 
+    @router.get("/schedule/po-gantt/process-check", dependencies=deps)
+    def po_gantt_process_check(plant: Optional[str] = Query(None), db: Session = Depends(init_db)):
+        return _guard(lambda: process_check(db, plant))
+
     @router.get("/schedule/po-gantt/plants", dependencies=deps)
     def po_gantt_plants(db: Session = Depends(init_db)):
         return list_plants(db)
@@ -1648,6 +2371,7 @@ def create_po_gantt_router(init_db, verify_token=None, engine=None) -> APIRouter
 
     @router.get("/schedule/po-gantt", dependencies=deps)
     def po_gantt(
+        request: Request,
         production_order: Optional[List[str]] = Query(None, description="PO numbers to load; order = load priority"),
         plant: Optional[str] = Query(None),
         start_date: Optional[date] = Query(None, description="default: first working day on/after today"),
@@ -1657,7 +2381,8 @@ def create_po_gantt_router(init_db, verify_token=None, engine=None) -> APIRouter
         shift_start: float = Query(DEFAULT_SHIFT_START, ge=0, le=20),
         db: Session = Depends(init_db),
     ):
-        return _run(db, production_order, plant, start_date, time_source, label_mode, show_holidays, shift_start)
+        return _send(_run(db, production_order, plant, start_date, time_source, label_mode, show_holidays, shift_start),
+                     request, drop_for_page=True)
 
     @router.get("/schedule/po-gantt/export", dependencies=deps)
     def po_gantt_export(
@@ -1701,7 +2426,7 @@ def create_po_gantt_router(init_db, verify_token=None, engine=None) -> APIRouter
         return _guard(lambda: delete_plan(db, plan_id), db)
 
     @router.get("/schedule/plans/{plan_id}/compare", dependencies=deps)
-    def plans_compare(plan_id: int, db: Session = Depends(init_db)):
-        return _guard(lambda: compare_plan(db, plan_id))
+    def plans_compare(plan_id: int, request: Request, db: Session = Depends(init_db)):
+        return _send(_guard(lambda: compare_plan(db, plan_id)), request)
 
     return router
